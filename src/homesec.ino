@@ -10,9 +10,10 @@
 int sum = 0;                    // sum of samples taken
 unsigned char sample_count = 0; // current sample number
 float voltage = 0.0;            // calculated voltage
+
 /* ******** Ethernet Card Settings ******** */
 // Set this to your Ethernet Card Mac Address
-// THIS IS FAKE!!!
+// This is a fake MAC address due to old Ethernet Shield
 byte mac[] = { 0x90, 0xA2, 0xDA, 0x00, 0x23, 0x36 };
 
 /* ******** NTP Server Settings ******** */
@@ -25,10 +26,8 @@ IPAddress timeServer(216, 23, 247, 62);
    TODO: Doesn't account for daylight savings!!*/
 const long timeZoneOffset = -21600L;
 
-/* Syncs to NTP server every 15 seconds for testing,
-   set to 1 hour or more to be reasonable */
+// Syncs to NTP server every hour
 unsigned int ntpSyncTime = 3600;
-
 
 /* ALTER THESE VARIABLES AT YOUR OWN RISK */
 // local port to listen for UDP packets
@@ -44,25 +43,30 @@ unsigned long ntpLastUpdate = 0;
 // Check last time clock displayed (Not in Production)
 time_t prevDisplay = 0;
 
+// Initialize the Ethernet server library
+// with the IP address and port you want to use
+// (port 80 is default for HTTP):
+EthernetServer server(80);
+
 void setup()
 {
     Serial.begin(9600);
 
     // Ethernet shield and NTP setup
     int i = 0;
-    int DHCP = 0;
-    DHCP = Ethernet.begin(mac);
+    int dhcp_rc = 0;
+    dhcp_rc = Ethernet.begin(mac);
     //Try to get dhcp settings 30 times before giving up
-    while( DHCP == 0 && i < 30){
+    while( dhcp_rc == 0 && i < 30){
         delay(1000);
-        DHCP = Ethernet.begin(mac);
+        dhcp_rc = Ethernet.begin(mac);
         i++;
     }
-    if(!DHCP){
-        Serial.println("DHCP FAILED");
+    if(!dhcp_rc){
+        Serial.println("Error: DHCP setup failed");
         for(;;); //Infinite loop because DHCP Failed
     }
-    Serial.println("DHCP Success");
+    Serial.println("DHCP success");
 
     // print your local IP address:
     Serial.print("My IP address: ");
@@ -72,15 +76,16 @@ void setup()
         Serial.print(".");
     }
     Serial.println();
-    IPAddress testIP;
+    IPAddress timeServer;
 
     DNSClient dns;
-    // TODO check this
     dns.begin(Ethernet.dnsServerIP());
-    dns.getHostByName("pool.ntp.org",testIP);
+    if (!dns.getHostByName("pool.ntp.org", timeServer)){
+        Serial.println("Error: Could not resolve IP of pool.ntp.org");
+        for(;;);
+    }
     Serial.print("NTP IP from the pool: ");
-    Serial.println(testIP);
-    timeServer = testIP;
+    Serial.println(timeServer);
 
     //Try to get the date and time
     int tryAttempts=20;
@@ -88,12 +93,16 @@ void setup()
     while(!getTimeAndDate() && trys<tryAttempts) {
         trys++;
     }
-    if(trys<tryAttempts){
-        Serial.println("ntp server update success");
+    if(trys==tryAttempts){
+        Serial.println("Error: Could not get NTP updates");
+        // TODO FIX THIS!
+        //for(;;);
     }
-    else{
-        Serial.println("ntp server update failed");
-    }
+    Serial.println("NTP update success");
+
+    //start the server
+    server.begin();
+    Serial.println("Web server started");
 }
 
 // Do not alter this function, it is used by the system
@@ -141,8 +150,7 @@ void printDigits(int digits){
     Serial.print(digits);
 }
 
-// Clock display of the time and date (Basic)
-void clockDisplay(){
+void printTime(){
     Serial.print(hour());
     printDigits(minute());
     printDigits(second());
@@ -163,31 +171,128 @@ void loop()
         while(!getTimeAndDate() && trys<10){
             trys++;
         }
-        if(trys>=10){
-            Serial.println("ntp server update still failing!");
-            delay(5);
-            return;
+        if(trys==10){
+            Serial.println("Error: NTP update failed");
         }
     }
 
-    // take a number of analog samples and add them up
-    while (sample_count < NUM_SAMPLES) {
-        sum += analogRead(A5);
-        sample_count++;
-        delay(10);
+    // listen for incoming clients
+    EthernetClient client = server.available();
+    if (client) {
+        Serial.println("new client connected!");
+        // an http request ends with a blank line
+        boolean currentLineIsBlank = true;
+        while (client.connected()) {
+            if (client.available()) {
+                char c = client.read();
+                Serial.write(c);
+                // if you've gotten to the end of the line (received a newline
+                // character) and the line is blank, the http request has ended,
+                // so you can send a reply
+                if (c == '\n' && currentLineIsBlank) {
+                    // send a standard http response header
+                    client.println("HTTP/1.1 200 OK");
+                    client.println("Content-Type: text/html");
+                    client.println(
+                            "Connection: close");  // the connection will be closed after completion of the response
+                    client.println("Refresh: 5");  // refresh the page automatically every 5 sec
+                    client.println();
+                    client.println("<!DOCTYPE HTML>");
+                    client.println("<html>");
+                    // output the value of each analog input pin
+                    for (int analogChannel = 0; analogChannel < 6; analogChannel++) {
+                        // take a number of analog samples and add them up
+                        float reading = analogRead(analogChannel);
+                        // 5.07V is the calibrated reference voltage by measuring 5V pins on arduino
+                        //voltage is divided by 11. Should be calibrated, but we are looking for tolerance anyways.
+                        float voltage = ((reading * 5.07) / 1024.0) * 11.0;
+                        String message = "analog reading uninitialized";
+                        String color = "black";
+
+                        switch (analogChannel) {
+                            case 0:
+                                color = "green";
+                                message = "Front/Back Door + Living/Kitchen/Bath Windows are secure";
+                                if (7.0 <= voltage && voltage < 7.5){
+                                    color = "red";
+                                    message = "Living, Kitchen, or Bath window is open!";
+                                } else if (9.0 <= voltage && voltage < 9.5){
+                                    color = "red";
+                                    message = "Front or Back door is open!";
+                                } else if (13.0 <= voltage && voltage < 14.0){
+                                    color = "red";
+                                    message = "Front or Back Door and Living, Kitchen, or Bath window is open!";
+                                }
+                                break;
+                            case 1:
+                                color = "green";
+                                message = "Downstairs window is secure";
+                                if (9.0 <= voltage && voltage < 9.5){
+                                    color = "red";
+                                    message = "Downstairs window is open!";
+                                }
+                                break;
+                            case 2:
+                                color = "green";
+                                message = "Garage + Bedroom doors are secure";
+                                if (7.0 <= voltage && voltage < 7.5){
+                                    color = "red";
+                                    message = "Garage door is open!";
+                                } else if (9.0 <= voltage && voltage < 9.5){
+                                    color = "red";
+                                    message = "Bedroom door is open!";
+                                } else if (13.0 <= voltage && voltage < 14.0){
+                                    color = "red";
+                                    message = "Garage and bedroom doors are open!";
+                                }
+                                break;
+                            case 3:
+                                color = "green";
+                                message = "Guest windows are secure";
+                                if (9.0 <= voltage && voltage < 9.5){
+                                    color = "red";
+                                    message = "Guest windows are open!";
+                                }
+                                break;
+                            case 4:
+                                color = "green";
+                                message = "Balcony door is secure";
+                                if (9.0 <= voltage && voltage < 9.5){
+                                    color = "red";
+                                    message = "Balcony door is open!";
+                                }
+                                break;
+                            case 5:
+                                color = "green";
+                                message = "Staircase window (2nd floor) is secure";
+                                if (9.0 <= voltage && voltage < 9.5){
+                                    color = "red";
+                                    message = "Staircase window (2nd floor) is open!";
+                                }
+                                break;
+                        }
+                        //printTime();
+                        client.print("<font color=\"" + color + "\">");
+                        client.print(message);
+                        client.print("</font>");
+                        client.println("<br />");
+                    }
+                    client.println("</html>");
+                    break;
+                }
+                if (c == '\n') {
+                    // you're starting a new line
+                    currentLineIsBlank = true;
+                } else if (c != '\r') {
+                    // you've gotten a character on the current line
+                    currentLineIsBlank = false;
+                }
+            }
+        }
+        // give the web browser time to receive the data
+        delay(1);
+        // close the connection:
+        client.stop();
+        Serial.println("client disconnected");
     }
-    // calculate the voltage
-    // use 5.0 for a 5.0V ADC reference voltage
-    // 5.07V is the calibrated reference voltage
-    float voltage = ((float) sum / (float) NUM_SAMPLES * 5.07) / 1024.0;
-    // send voltage for display on Serial Monitor
-    // voltage multiplied by 11 when using voltage divider that
-    // divides by 11. 11.132 is the calibrated voltage divide
-    // value
-    clockDisplay();
-    Serial.println(voltage * 11.0);
-//    Serial.print(voltage * 11.132);
-//    Serial.println (" V");
-    sample_count = 0;
-    sum = 0;
 }
